@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <vector>
 #include <string>
 
@@ -29,60 +30,17 @@ static size_t type_width(ScanType t) {
     }
 }
 
-static ScanType type_from_string(const std::string& s) {
-    std::string v = lower(s);
-    if (v == "i8"  || v == "byte"  || v == "int8")   return ScanType::I8;
-    if (v == "i16" || v == "short" || v == "int16")  return ScanType::I16;
-    if (v == "i32" || v == "int"   || v == "int32" || v == "dword") return ScanType::I32;
-    if (v == "i64" || v == "int64" || v == "qword")  return ScanType::I64;
-    if (v == "f32" || v == "float")                  return ScanType::F32;
-    if (v == "f64" || v == "double")                 return ScanType::F64;
-    if (v == "str" || v == "string")                 return ScanType::Str;
-    if (v == "aob" || v == "bytes")                  return ScanType::Aob;
-    return ScanType::I32;
-}
-
 static std::vector<uint8_t> value_to_bytes(ScanType t, const std::string& text) {
     std::vector<uint8_t> out;
     switch (t) {
-        case ScanType::I8: {
-            int64_t v = std::strtoll(text.c_str(), nullptr, 0);
-            out.push_back((uint8_t)v);
-            break;
-        }
-        case ScanType::I16: {
-            int64_t v = std::strtoll(text.c_str(), nullptr, 0);
-            out.resize(2); std::memcpy(out.data(), &v, 2);
-            break;
-        }
-        case ScanType::I32: {
-            int64_t v = std::strtoll(text.c_str(), nullptr, 0);
-            out.resize(4); std::memcpy(out.data(), &v, 4);
-            break;
-        }
-        case ScanType::I64: {
-            int64_t v = std::strtoll(text.c_str(), nullptr, 0);
-            out.resize(8); std::memcpy(out.data(), &v, 8);
-            break;
-        }
-        case ScanType::F32: {
-            float v = (float)std::strtod(text.c_str(), nullptr);
-            out.resize(4); std::memcpy(out.data(), &v, 4);
-            break;
-        }
-        case ScanType::F64: {
-            double v = std::strtod(text.c_str(), nullptr);
-            out.resize(8); std::memcpy(out.data(), &v, 8);
-            break;
-        }
-        case ScanType::Str: {
-            out.assign(text.begin(), text.end());
-            out.push_back(0); // null-terminated match
-            break;
-        }
-        case ScanType::Aob:
-            out = parse_hex(text);
-            break;
+        case ScanType::I8:  { int64_t v = std::strtoll(text.c_str(), nullptr, 0); out.push_back((uint8_t)v); break; }
+        case ScanType::I16: { int64_t v = std::strtoll(text.c_str(), nullptr, 0); out.resize(2); std::memcpy(out.data(), &v, 2); break; }
+        case ScanType::I32: { int64_t v = std::strtoll(text.c_str(), nullptr, 0); out.resize(4); std::memcpy(out.data(), &v, 4); break; }
+        case ScanType::I64: { int64_t v = std::strtoll(text.c_str(), nullptr, 0); out.resize(8); std::memcpy(out.data(), &v, 8); break; }
+        case ScanType::F32: { float v = (float)std::strtod(text.c_str(), nullptr); out.resize(4); std::memcpy(out.data(), &v, 4); break; }
+        case ScanType::F64: { double v = std::strtod(text.c_str(), nullptr); out.resize(8); std::memcpy(out.data(), &v, 8); break; }
+        case ScanType::Str: { out.assign(text.begin(), text.end()); out.push_back(0); break; }
+        case ScanType::Aob: out = parse_hex(text); break;
     }
     return out;
 }
@@ -100,12 +58,9 @@ static bool numeric_from_bytes(ScanType t, const uint8_t* p, double& out) {
 }
 
 // -----------------------------------------------------------------------------
-// region iteration
+// regions
 // -----------------------------------------------------------------------------
-struct Region {
-    uint64_t base;
-    uint64_t size;
-};
+struct Region { uint64_t base; uint64_t size; };
 
 static std::vector<Region> scannable_regions(uint32_t pid, bool writable_only) {
     std::vector<Region> out;
@@ -140,22 +95,18 @@ size_t scan_first(uint32_t pid, ScanType type, const std::string& value,
     st.hits.clear();
 
     std::vector<uint8_t> needle = value_to_bytes(type, value);
-    size_t w = (type == ScanType::Str) ? needle.size() - 1 : needle.size();
-    if (type == ScanType::Str || type == ScanType::Aob) w = needle.size();
+    size_t w = needle.size();
     st.width = w;
     if (w == 0) return 0;
 
-    const size_t CHUNK = 1 << 20; // 1 MiB
+    const size_t CHUNK = 1 << 20;
     std::vector<uint8_t> buf(CHUNK + w);
 
     for (auto& r : scannable_regions(pid, writable_only)) {
         uint64_t off = 0;
         while (off < r.size) {
             size_t want = (size_t)std::min<uint64_t>(CHUNK, r.size - off);
-            if (!read_mem(pid, r.base + off, buf.data(), want)) {
-                off += want;
-                continue;
-            }
+            if (!read_mem(pid, r.base + off, buf.data(), want)) { off += want; continue; }
             if (want >= w) {
                 for (size_t k = 0; k + w <= want; ++k) {
                     if (std::memcmp(buf.data() + k, needle.data(), w) == 0) {
@@ -187,7 +138,6 @@ static std::vector<AobByte> parse_aob(const std::string& pattern) {
             continue;
         }
         if (std::isxdigit((unsigned char)c)) {
-            // read up to two hex chars
             int v = 0, n = 0;
             while (n < 2 && k < pattern.size() && std::isxdigit((unsigned char)pattern[k])) {
                 char h = pattern[k];
@@ -200,7 +150,7 @@ static std::vector<AobByte> parse_aob(const std::string& pattern) {
             out.push_back({ (uint8_t)v, false });
             continue;
         }
-        ++k; // skip separators
+        ++k;
     }
     return out;
 }
@@ -244,12 +194,53 @@ size_t scan_aob(uint32_t pid, const std::string& pattern, bool writable_only, si
 }
 
 // -----------------------------------------------------------------------------
+// exact-value scan over memory (returns addresses)
+// -----------------------------------------------------------------------------
+std::vector<uint64_t> scan_exact_value(uint32_t pid, uint64_t value, int width,
+                                       bool writable_only, bool aligned, size_t max_hits) {
+    std::vector<uint64_t> out;
+    if (width != 4 && width != 8) width = 8;
+    const size_t w = (size_t)width;
+
+    std::vector<uint8_t> needle(w, 0);
+    std::memcpy(needle.data(), &value, w);
+
+    const size_t CHUNK = 1 << 20;
+    std::vector<uint8_t> buf(CHUNK + w);
+    const size_t step = aligned ? w : 1;
+
+    for (auto& r : scannable_regions(pid, writable_only)) {
+        uint64_t off = 0;
+        while (off < r.size && out.size() < max_hits) {
+            size_t want = (size_t)std::min<uint64_t>(CHUNK, r.size - off);
+            if (!read_mem(pid, r.base + off, buf.data(), want)) { off += want; continue; }
+            if (want >= w) {
+                // align start relative to the region base when requested
+                size_t start = 0;
+                if (aligned) {
+                    uint64_t abs = r.base + off;
+                    size_t rem = (size_t)(abs % w);
+                    start = rem ? (w - rem) : 0;
+                }
+                for (size_t k = start; k + w <= want; k += step) {
+                    if (std::memcmp(buf.data() + k, needle.data(), w) == 0) {
+                        out.push_back(r.base + off + k);
+                        if (out.size() >= max_hits) break;
+                    }
+                }
+            }
+            off += want;
+        }
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
 // refine / next scan
 // -----------------------------------------------------------------------------
 size_t scan_refine(uint32_t pid, const std::string& mode, const std::string& value) {
     ScanState& st = scan_state();
     std::lock_guard<std::mutex> lk(st.mtx);
-
     if (!st.active) return 0;
 
     std::string m = lower(mode);
@@ -277,7 +268,7 @@ size_t scan_refine(uint32_t pid, const std::string& mode, const std::string& val
                 pass = (m == "increased") ? (a > b) : (a < b);
             }
         } else {
-            pass = true; // unknown mode: keep
+            pass = true;
         }
 
         if (pass) {
@@ -292,35 +283,53 @@ size_t scan_refine(uint32_t pid, const std::string& mode, const std::string& val
 }
 
 // -----------------------------------------------------------------------------
-// results
+// results (with live bytes per hit)
 // -----------------------------------------------------------------------------
-Json scan_results(size_t offset, size_t limit, uint32_t pid, const std::string& type_name) {
+Json hits_json(uint32_t pid, size_t offset, size_t limit) {
     ScanState& st = scan_state();
     std::lock_guard<std::mutex> lk(st.mtx);
 
     Json r = Json::obj();
-    r.set("active", st.active);
     r.set("total", (long long)st.hits.size());
     r.set("offset", (long long)offset);
+    r.set("returned", (long long)std::min(st.hits.size() - std::min(offset, st.hits.size()), limit));
 
     Json arr = Json::arr();
     size_t end = std::min(st.hits.size(), offset + limit);
     for (size_t k = offset; k < end; ++k) {
         Json h = Json::obj();
         h.set("address", u64_hex(st.hits[k].addr));
-        if (pid && st.width && st.width <= 16) {
+        if (pid && st.width && st.width <= 64) {
             std::vector<uint8_t> cur(st.width);
             if (read_mem(pid, st.hits[k].addr, cur.data(), st.width))
-                h.set("value", to_hex(cur.data(), cur.size()));
+                h.set("hex", to_hex(cur.data(), cur.size()));
         }
         arr.push(std::move(h));
     }
-    r.set("results", std::move(arr));
+    r.set("hits", std::move(arr));
+    return r;
+}
+
+Json scan_results(size_t offset, size_t limit, uint32_t pid, const std::string& type_name) {
+    (void)type_name;
+    ScanState& st = scan_state();
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        if (!st.active) {
+            Json r = Json::obj();
+            r.set("active", false);
+            r.set("total", 0);
+            r.set("hits", Json::arr());
+            return r;
+        }
+    }
+    Json r = hits_json(pid, offset, limit);
+    r.set("active", true);
     return r;
 }
 
 // -----------------------------------------------------------------------------
-// reverse pointer scan (one level: who points into [target-max_offset, target])
+// reverse pointer scan (one level)
 // -----------------------------------------------------------------------------
 Json pointer_scan(uint32_t pid, uint64_t target, size_t max_offset, size_t max_results) {
     Json r = Json::obj();
@@ -342,7 +351,7 @@ Json pointer_scan(uint32_t pid, uint64_t target, size_t max_offset, size_t max_r
                 for (size_t k = 0; k + pw <= want; k += (is64 ? 4 : 2)) {
                     uint64_t v = 0;
                     std::memcpy(&v, buf.data() + k, pw);
-                    if (is64) v &= 0x0000FFFFFFFFFFFFull; // canonical user-space
+                    if (is64) v &= 0x0000FFFFFFFFFFFFull;
                     if (v >= lo && v <= target) {
                         Json h = Json::obj();
                         h.set("address", u64_hex(reg.base + off + k));
@@ -362,6 +371,61 @@ Json pointer_scan(uint32_t pid, uint64_t target, size_t max_offset, size_t max_r
     r.set("count", (long long)arr.size());
     r.set("results", std::move(arr));
     return r;
+}
+
+// -----------------------------------------------------------------------------
+// persistence
+// -----------------------------------------------------------------------------
+bool scan_save(const std::string& path, std::string& err) {
+    ScanState& st = scan_state();
+    std::lock_guard<std::mutex> lk(st.mtx);
+
+    Json j = Json::obj();
+    j.set("version", 1);
+    j.set("active", st.active);
+    j.set("type", (long long)st.type);
+    j.set("width", (long long)st.width);
+    j.set("pattern", st.pattern);
+    Json arr = Json::arr();
+    for (auto& h : st.hits) {
+        Json e = Json::obj();
+        e.set("a", u64_hex(h.addr));
+        if (!h.prev.empty()) e.set("p", to_hex(h.prev.data(), h.prev.size()));
+        arr.push(std::move(e));
+    }
+    j.set("hits", std::move(arr));
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open for write: " + path; return false; }
+    std::string s = j.dump();
+    f.write(s.data(), (std::streamsize)s.size());
+    return true;
+}
+
+bool scan_load(const std::string& path, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open: " + path; return false; }
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    Json j;
+    try { j = Json::parse(s); } catch (const std::exception& e) { err = e.what(); return false; }
+
+    ScanState& st = scan_state();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    st.active = j.has("active") ? j.at("active").as_b() : true;
+    st.type = (ScanType)(j.has("type") ? j.at("type").as_i() : (long long)ScanType::I32);
+    st.width = (size_t)(j.has("width") ? j.at("width").as_i() : 4);
+    st.pattern = j.has("pattern") ? j.at("pattern").as_s() : "";
+    st.hits.clear();
+    if (j.has("hits")) {
+        for (auto& e : j.at("hits").a) {
+            ScanHit h;
+            h.addr = parse_u64(e.at("a"));
+            if (e.has("p")) h.prev = parse_hex(e.at("p").as_s());
+            st.hits.push_back(std::move(h));
+        }
+    }
+    return true;
 }
 
 void scan_reset() {

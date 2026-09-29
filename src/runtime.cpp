@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <deque>
+#include <map>
 #include <atomic>
 #include <chrono>
 
@@ -69,6 +71,11 @@ Json freeze_list() {
 // =============================================================================
 // watch manager
 // =============================================================================
+struct WatchSample {
+    uint64_t t_ms;
+    std::string hex;
+};
+
 struct WatchEntry {
     int id;
     uint32_t pid;
@@ -76,7 +83,10 @@ struct WatchEntry {
     size_t width;
     std::string type;
     std::vector<uint8_t> last;
+    std::deque<WatchSample> history;   // bounded series
 };
+
+static const size_t kMaxWatchHistory = 1024;
 
 static std::mutex g_watch_mtx;
 static std::vector<WatchEntry> g_watches;
@@ -90,9 +100,15 @@ Json watch_add(uint32_t pid, uint64_t addr, size_t width, const std::string& typ
     e.addr = addr;
     e.width = width ? width : 4;
     e.type = type;
-    g_watches.push_back(e);
+    // capture the current value as the baseline so the first poll can report a change
+    e.last.resize(e.width);
+    if (!read_mem(pid, addr, e.last.data(), e.width)) e.last.clear();
+    g_watches.push_back(std::move(e));
     Json r = Json::obj();
-    r.set("id", (long long)e.id);
+    r.set("id", (long long)g_watches.back().id);
+    r.set("baseline", g_watches.back().last.empty() ? std::string("unreadable")
+                                                    : to_hex(g_watches.back().last.data(),
+                                                             g_watches.back().last.size()));
     return r;
 }
 
@@ -102,13 +118,49 @@ Json watch_poll(int id) {
     for (auto& e : g_watches) {
         if (e.id != id) continue;
         std::vector<uint8_t> cur(e.width);
-        if (!read_mem(e.pid, e.addr, cur.data(), e.width)) { r.set("error", "read failed"); return r; }
+        if (!read_mem(e.pid, e.addr, cur.data(), e.width)) {
+            DWORD err = 0;
+            read_mem(e.pid, e.addr, cur.data(), e.width, &err);
+            Json e2 = win32_error_json(err, "watch_poll read");
+            e2.set("id", (long long)e.id);
+            return e2;
+        }
         bool changed = !e.last.empty() && std::memcmp(cur.data(), e.last.data(), e.width) != 0;
         r.set("id", (long long)e.id);
         r.set("changed", changed);
         r.set("value", to_hex(cur.data(), cur.size()));
         if (!e.last.empty()) r.set("previous", to_hex(e.last.data(), e.last.size()));
+
+        WatchSample s;
+        s.t_ms = GetTickCount64();
+        s.hex = to_hex(cur.data(), cur.size());
+        e.history.push_back(std::move(s));
+        while (e.history.size() > kMaxWatchHistory) e.history.pop_front();
+        r.set("samples", (long long)e.history.size());
+
         e.last = cur;
+        return r;
+    }
+    r.set("error", "watch not found");
+    return r;
+}
+
+Json watch_series(int id, size_t count) {
+    std::lock_guard<std::mutex> lk(g_watch_mtx);
+    Json r = Json::obj();
+    for (auto& e : g_watches) {
+        if (e.id != id) continue;
+        r.set("id", (long long)e.id);
+        r.set("total_samples", (long long)e.history.size());
+        Json arr = Json::arr();
+        size_t start = (count && e.history.size() > count) ? e.history.size() - count : 0;
+        for (size_t k = start; k < e.history.size(); ++k) {
+            Json s = Json::obj();
+            s.set("t_ms", (long long)e.history[k].t_ms);
+            s.set("value", e.history[k].hex);
+            arr.push(std::move(s));
+        }
+        r.set("series", std::move(arr));
         return r;
     }
     r.set("error", "watch not found");
@@ -316,6 +368,102 @@ Json speedhack(uint32_t pid, double scale, const std::string& which) {
     r.set("scale", scale);
     r.set("factor_32_32", u64_hex(factor));
     r.set("installed", std::move(installed));
+    return r;
+}
+
+// =============================================================================
+// memory snapshots + differential diff
+// =============================================================================
+struct Snapshot {
+    int id;
+    uint32_t pid;
+    uint64_t addr;
+    size_t size;
+    uint64_t t_ms;
+    std::vector<uint8_t> data;
+};
+
+static std::mutex g_snap_mtx;
+static std::map<int, Snapshot> g_snaps;
+static std::atomic<int> g_snap_next{1};
+
+int snapshot_take(uint32_t pid, uint64_t addr, size_t size) {
+    std::vector<uint8_t> buf(size);
+    if (!read_mem(pid, addr, buf.data(), size)) return -1;
+    Snapshot s;
+    s.id = g_snap_next++;
+    s.pid = pid;
+    s.addr = addr;
+    s.size = size;
+    s.t_ms = GetTickCount64();
+    s.data = std::move(buf);
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
+    int id = s.id;
+    g_snaps[id] = std::move(s);
+    return id;
+}
+
+Json snapshot_diff(int id) {
+    Snapshot snap;
+    {
+        std::lock_guard<std::mutex> lk(g_snap_mtx);
+        auto it = g_snaps.find(id);
+        if (it == g_snaps.end()) { Json r = Json::obj(); r.set("error", "snapshot not found"); return r; }
+        snap = it->second;
+    }
+
+    std::vector<uint8_t> cur(snap.size);
+    DWORD err = 0;
+    if (!read_mem(snap.pid, snap.addr, cur.data(), snap.size, &err)) {
+        Json r = win32_error_json(err, "snapshot_diff read");
+        r.set("id", (long long)id);
+        return r;
+    }
+
+    Json ranges = Json::arr();
+    size_t changed_bytes = 0;
+    size_t k = 0;
+    while (k < snap.size) {
+        if (cur[k] == snap.data[k]) { ++k; continue; }
+        size_t start = k;
+        while (k < snap.size && cur[k] != snap.data[k]) ++k;
+        size_t len = k - start;
+        changed_bytes += len;
+        Json e = Json::obj();
+        e.set("address", u64_hex(snap.addr + start));
+        e.set("offset", (long long)start);
+        e.set("length", (long long)len);
+        e.set("before", to_hex(snap.data.data() + start, len));
+        e.set("after", to_hex(cur.data() + start, len));
+        ranges.push(std::move(e));
+        if (ranges.size() >= 100000) break;
+    }
+
+    Json r = Json::obj();
+    r.set("id", (long long)id);
+    r.set("base", u64_hex(snap.addr));
+    r.set("size", (long long)snap.size);
+    r.set("changed_bytes", (long long)changed_bytes);
+    r.set("changed_ranges", (long long)ranges.size());
+    r.set("diff", std::move(ranges));
+    return r;
+}
+
+Json snapshot_list() {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
+    Json arr = Json::arr();
+    for (auto& kv : g_snaps) {
+        Json e = Json::obj();
+        e.set("id", (long long)kv.second.id);
+        e.set("pid", (long long)kv.second.pid);
+        e.set("address", u64_hex(kv.second.addr));
+        e.set("size", (long long)kv.second.size);
+        e.set("t_ms", (long long)kv.second.t_ms);
+        arr.push(std::move(e));
+    }
+    Json r = Json::obj();
+    r.set("count", (long long)arr.size());
+    r.set("snapshots", std::move(arr));
     return r;
 }
 

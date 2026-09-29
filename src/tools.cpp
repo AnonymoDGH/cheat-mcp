@@ -3,6 +3,7 @@
 #include <fstream>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 
 namespace cmcp {
@@ -45,6 +46,16 @@ static ToolResult fail(const std::string& msg) {
     r.text = j.dump();
     return r;
 }
+
+static ToolResult fail_json(Json j) {
+    ToolResult r;
+    r.is_error = true;
+    r.structured = j;
+    r.text = j.dump();
+    return r;
+}
+
+static void register_extra_tools();
 
 static void reg(const char* name, const char* desc, Json s, ToolFn fn) {
     registry().add(name, desc, std::move(s), std::move(fn));
@@ -184,16 +195,55 @@ void register_all_tools() {
             return ok(j);
         });
 
-    reg("process_open", "Open a handle to a process by pid or name (cached).",
-        schema({ {"pid", prop("integer", "process id")}, {"name", prop("string", "process name")} }),
+    reg("process_open", "Open a process by pid or name. Multiple matches are ranked by working set; "
+                        "use list_candidates to see them all (e.g. loader vs game exe).",
+        schema({ {"pid", prop("integer", "process id (overrides name)")},
+                  {"name", prop("string", "process name")},
+                  {"list_candidates", prop("boolean", "return all matches without opening")} }),
         [](const Json& a) {
-            uint32_t pid = require_pid(a);
-            if (!pid) return fail("pid or name required");
-            HANDLE h = get_handle(pid);
             Json j = Json::obj();
+            uint32_t pid = a.has("pid") ? (uint32_t)parse_u64(a.at("pid")) : 0;
+
+            if (!pid && a.has("name")) {
+                auto cands = find_process_candidates(a.at("name").as_s());
+                if (cands.empty()) {
+                    Json e = win32_error_json(ERROR_FILE_NOT_FOUND, "process_open");
+                    e.set("name", a.at("name").as_s());
+                    return fail_json(e);
+                }
+                Json list = Json::arr();
+                for (auto& c : cands) {
+                    Json e = Json::obj();
+                    e.set("pid", (long long)c.info.pid);
+                    e.set("name", c.info.name);
+                    e.set("path", c.info.path);
+                    e.set("working_set", (long long)c.working_set);
+                    list.push(std::move(e));
+                }
+                if (a.has("list_candidates") && a.at("list_candidates").as_b()) {
+                    j.set("candidates", std::move(list));
+                    j.set("count", (long long)cands.size());
+                    return ok(j);
+                }
+                pid = cands.front().info.pid;   // largest working set
+                j.set("candidates", std::move(list));
+                j.set("chosen", (long long)pid);
+            }
+
+            if (!pid) return fail("pid or name required");
+
+            DWORD err = 0;
+            HANDLE h = get_handle_err(pid, &err);
             j.set("pid", (long long)pid);
             j.set("opened", h != nullptr);
-            j.set("is_64bit", h ? is_process_64(pid) : false);
+            if (h) {
+                j.set("is_64bit", is_process_64(pid));
+                j.set("elevated_process", current_process_elevated());
+            } else {
+                Json e = win32_error_json(err, "process_open/OpenProcess");
+                e.set("pid", (long long)pid);
+                return fail_json(e);
+            }
             return ok(j);
         });
 
@@ -335,7 +385,13 @@ void register_all_tools() {
             size_t n = a.has("size") ? (size_t)parse_u64(a.at("size")) : 256;
             if (n == 0 || n > (1 << 20)) n = 256;
             std::vector<uint8_t> buf(n);
-            if (!read_mem(pid, addr, buf.data(), n)) return fail("read failed");
+            DWORD err = 0;
+            if (!read_mem(pid, addr, buf.data(), n, &err)) {
+                Json e = win32_error_json(err, "memory_read");
+                e.set("address", u64_hex(addr));
+                e.set("size", (long long)n);
+                return fail_json(e);
+            }
             Json j = Json::obj();
             j.set("address", u64_hex(addr));
             j.set("size", (long long)n);
@@ -360,11 +416,17 @@ void register_all_tools() {
             uint64_t addr = parse_u64(a.at("address"));
             auto bytes = parse_hex(a.at("data").as_s());
             if (bytes.empty()) return fail("no bytes");
-            bool okw = write_mem(pid, addr, bytes.data(), bytes.size());
+            DWORD err = 0;
+            bool okw = write_mem(pid, addr, bytes.data(), bytes.size(), &err);
             Json j = Json::obj();
             j.set("written", okw);
             j.set("bytes", (long long)bytes.size());
-            return okw ? ok(j) : fail("write failed");
+            if (!okw) {
+                Json e = win32_error_json(err, "memory_write");
+                e.set("address", u64_hex(addr));
+                return fail_json(e);
+            }
+            return ok(j);
         });
 
     reg("memory_alloc", "Allocate memory inside the target process.",
@@ -485,8 +547,9 @@ void register_all_tools() {
             bool wo = a.has("writable_only") ? a.at("writable_only").as_b() : true;
             size_t maxh = a.has("max_hits") ? (size_t)parse_u64(a.at("max_hits")) : 1000000;
             size_t n = scan_first(pid, stype(a.at("type").as_s()), a.at("value").as_s(), wo, maxh);
-            Json j = Json::obj();
-            j.set("hits", (long long)n);
+            size_t lim = a.has("limit") ? (size_t)parse_u64(a.at("limit")) : 100;
+            Json j = hits_json(pid, 0, lim);
+            j.set("count", (long long)n);
             return ok(j);
         });
 
@@ -499,7 +562,10 @@ void register_all_tools() {
             bool wo = a.has("writable_only") ? a.at("writable_only").as_b() : false;
             size_t maxh = a.has("max_hits") ? (size_t)parse_u64(a.at("max_hits")) : 1000;
             size_t n = scan_aob(pid, a.at("pattern").as_s(), wo, maxh);
-            Json j = Json::obj(); j.set("hits", (long long)n); return ok(j);
+            size_t lim = a.has("limit") ? (size_t)parse_u64(a.at("limit")) : 100;
+            Json j = hits_json(pid, 0, lim);
+            j.set("count", (long long)n);
+            return ok(j);
         });
 
     reg("scan_refine", "Next-scan: filter previous results (exact/changed/unchanged/increased/decreased).",
@@ -783,6 +849,354 @@ void register_all_tools() {
             double sc = a.has("scale") ? a.at("scale").as_d() : 1.0;
             std::string w = a.has("which") ? a.at("which").as_s() : "qpc";
             return ok(speedhack((uint32_t)parse_u64(a.at("pid")), sc, w));
+        });
+
+    register_extra_tools();
+}
+
+// =============================================================================
+// extra tools: elevation, typed reads, struct reads, snapshots, persistence
+// =============================================================================
+static void put_typed(uint32_t pid, uint64_t addr, const std::string& type, Json& out,
+                      const std::string& key) {
+    std::string t = lower(type);
+    if (t == "i8")  { uint8_t b;  if (read_mem(pid, addr, &b, 1)) out.set(key, (long long)(int8_t)b); }
+    else if (t == "i16") { int16_t v; if (read_mem(pid, addr, &v, 2)) out.set(key, (long long)v); }
+    else if (t == "i32") { int32_t v; if (read_mem(pid, addr, &v, 4)) out.set(key, (long long)v); }
+    else if (t == "i64") { int64_t v; if (read_mem(pid, addr, &v, 8)) out.set(key, (long long)v); }
+    else if (t == "u32") { uint32_t v; if (read_mem(pid, addr, &v, 4)) out.set(key, (long long)v); }
+    else if (t == "u64" || t == "ptr") { uint64_t v = 0; if (read_mem(pid, addr, &v, 8)) out.set(key, u64_hex(v)); }
+    else if (t == "f32") { float v; if (read_mem(pid, addr, &v, 4)) out.set(key, (double)v); }
+    else if (t == "f64") { double v; if (read_mem(pid, addr, &v, 8)) out.set(key, v); }
+    else if (t == "vec3") {
+        float v[3]; if (read_mem(pid, addr, v, 12)) {
+            Json a = Json::arr(); a.push((double)v[0]); a.push((double)v[1]); a.push((double)v[2]);
+            out.set(key, std::move(a));
+        }
+    } else if (t == "mat4") {
+        float v[16]; if (read_mem(pid, addr, v, 64)) {
+            Json rows = Json::arr();
+            for (int r = 0; r < 4; ++r) {
+                Json row = Json::arr();
+                for (int c = 0; c < 4; ++c) row.push((double)v[r * 4 + c]);
+                rows.push(std::move(row));
+            }
+            out.set(key, std::move(rows));
+        }
+    } else if (t == "cstr") {
+        char buf[256] = {}; if (read_mem(pid, addr, buf, sizeof(buf) - 1)) out.set(key, std::string(buf));
+    } else if (t.rfind("bytes", 0) == 0) {
+        size_t n = 16;
+        size_t c = t.find(':');
+        if (c != std::string::npos) n = (size_t)std::strtoul(t.c_str() + c + 1, nullptr, 0);
+        std::vector<uint8_t> b(n);
+        if (read_mem(pid, addr, b.data(), n)) out.set(key, to_hex(b.data(), n));
+    }
+}
+
+static uint64_t resolve_base(uint32_t pid, const Json& a, bool& okbase) {
+    okbase = true;
+    if (a.has("module")) {
+        auto m = find_module(pid, a.at("module").as_s());
+        if (!m) { okbase = false; return 0; }
+        uint64_t cur = m->base;
+        size_t ptr = is_process_64(pid) ? 8 : 4;
+        if (a.has("offsets")) {
+            for (auto& off : a.at("offsets").a) {
+                cur += parse_u64(off);
+                uint64_t next = 0;
+                if (!read_mem(pid, cur, &next, ptr)) { okbase = false; return 0; }
+                cur = next;
+            }
+        } else if (a.has("offset")) {
+            cur += parse_u64(a.at("offset"));
+        }
+        return cur;
+    }
+    return a.has("address") ? parse_u64(a.at("address")) : 0;
+}
+
+static void register_extra_tools() {
+    // ---------------------------------------------------------- elevation
+    reg("elevate", "Relaunch this server as an elevated companion agent (triggers UAC). "
+                   "After this, use run_elevated() or elevated_route(true) for protected targets.",
+        schema(Json::obj()),
+        [](const Json&) {
+            std::string err;
+            bool okp = elevate_agent(err);
+            Json j = elevated_status();
+            j.set("ok", okp);
+            if (!okp && !err.empty()) j.set("error", err);
+            return ok(j);
+        });
+
+    reg("elevated_status", "Report elevation state: current process, agent, routing.",
+        schema(Json::obj()),
+        [](const Json&) { return ok(elevated_status()); });
+
+    reg("elevated_route", "When enabled, memory/process/scan/inject tools are transparently "
+                          "forwarded to the elevated agent.",
+        schema({ {"enabled", prop("boolean", "")} }, {"enabled"}),
+        [](const Json& a) {
+            bool en = a.at("enabled").as_b();
+            if (en && !agent_connected()) {
+                Json j = win32_error_json(ERROR_NOT_FOUND, "elevated_route");
+                j.set("error", "agent not connected — call elevate() first");
+                return fail_json(j);
+            }
+            set_elevated_route(en);
+            Json j = Json::obj();
+            j.set("route_enabled", en);
+            return ok(j);
+        });
+
+    reg("run_elevated", "Run any tool inside the elevated agent and return its result. "
+                        "The agent keeps its own handles and scan session.",
+        schema({ {"tool", prop("string", "tool name")},
+                  {"arguments", prop("object", "tool arguments")} }, {"tool"}),
+        [](const Json& a) {
+            std::string tool = a.at("tool").as_s();
+            Json args = a.has("arguments") ? a.at("arguments") : Json::obj();
+            if (!agent_connected()) {
+                Json j = win32_error_json(ERROR_NOT_FOUND, "run_elevated");
+                j.set("error", "agent not connected — call elevate() first");
+                return fail_json(j);
+            }
+            Json resp = agent_call(tool, args);
+            bool err = resp.has("is_error") ? resp.at("is_error").as_b() : false;
+            Json out = resp.has("structured") ? resp.at("structured") : resp;
+            return err ? fail_json(out) : ok(out);
+        });
+
+    reg("agent_shutdown", "Close the elevated agent and free its resources.",
+        schema(Json::obj()),
+        [](const Json&) {
+            agent_shutdown();
+            Json j = Json::obj();
+            j.set("closed", true);
+            return ok(j);
+        });
+
+    // ---------------------------------------------------------- candidates
+    reg("process_candidates", "List all processes matching a name, ranked by working set "
+                              "(disambiguates loader vs game exe).",
+        schema({ {"name", prop("string", "")} }, {"name"}),
+        [](const Json& a) {
+            auto cands = find_process_candidates(a.at("name").as_s());
+            Json arr = Json::arr();
+            for (auto& c : cands) {
+                Json e = Json::obj();
+                e.set("pid", (long long)c.info.pid);
+                e.set("name", c.info.name);
+                e.set("path", c.info.path);
+                e.set("working_set", (long long)c.working_set);
+                arr.push(std::move(e));
+            }
+            Json j = Json::obj();
+            j.set("count", (long long)arr.size());
+            j.set("candidates", std::move(arr));
+            return ok(j);
+        });
+
+    // ---------------------------------------------------------- exact ref scan
+    reg("scan_qword", "Reverse-reference scan: find addresses holding an exact value "
+                      "(e.g. who points to / stores this id or pointer).",
+        schema({ {"pid", prop("integer", "")}, {"value", prop("string", "hex or decimal")},
+                  {"width", prop("integer", "4 or 8 (default 8)")},
+                  {"writable_only", prop("boolean", "default true")},
+                  {"aligned", prop("boolean", "only aligned matches (fast, pointer-like)")},
+                  {"max_hits", prop("integer", "default 2000")} }, {"pid", "value"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t v = parse_u64(a.at("value"));
+            int w = a.has("width") ? (int)parse_u64(a.at("width")) : 8;
+            bool wo = a.has("writable_only") ? a.at("writable_only").as_b() : true;
+            bool al = a.has("aligned") ? a.at("aligned").as_b() : false;
+            size_t mh = a.has("max_hits") ? (size_t)parse_u64(a.at("max_hits")) : 2000;
+
+            auto res = scan_exact_value(pid, v, w, wo, al, mh);
+            Json arr = Json::arr();
+            for (auto x : res) arr.push(u64_hex(x));
+            Json j = Json::obj();
+            j.set("value", u64_hex(v));
+            j.set("width", w);
+            j.set("aligned", al);
+            j.set("count", (long long)res.size());
+            j.set("addresses", std::move(arr));
+            return ok(j);
+        });
+
+    // ---------------------------------------------------------- typed block reads
+    reg("read_floats", "Read N consecutive floats in one call.",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")},
+                  {"count", prop("integer", "")} }, {"pid", "address", "count"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            size_t n = (size_t)parse_u64(a.at("count"));
+            if (n == 0 || n > 65536) return fail("count out of range");
+            std::vector<float> v(n);
+            DWORD err = 0;
+            if (!read_mem(pid, addr, v.data(), n * 4, &err))
+                return fail_json(win32_error_json(err, "read_floats"));
+            Json arr = Json::arr();
+            for (float f : v) arr.push((double)f);
+            Json j = Json::obj();
+            j.set("address", u64_hex(addr));
+            j.set("count", (long long)n);
+            j.set("floats", std::move(arr));
+            return ok(j);
+        });
+
+    reg("read_ints", "Read N consecutive 32-bit ints in one call.",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")},
+                  {"count", prop("integer", "")} }, {"pid", "address", "count"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            size_t n = (size_t)parse_u64(a.at("count"));
+            if (n == 0 || n > 65536) return fail("count out of range");
+            std::vector<int32_t> v(n);
+            DWORD err = 0;
+            if (!read_mem(pid, addr, v.data(), n * 4, &err))
+                return fail_json(win32_error_json(err, "read_ints"));
+            Json arr = Json::arr();
+            for (int32_t x : v) arr.push((long long)x);
+            Json j = Json::obj();
+            j.set("address", u64_hex(addr));
+            j.set("count", (long long)n);
+            j.set("ints", std::move(arr));
+            return ok(j);
+        });
+
+    reg("read_vec3", "Read a 3-float vector.",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")} }, {"pid", "address"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            float v[3];
+            DWORD err = 0;
+            if (!read_mem(pid, addr, v, 12, &err)) return fail_json(win32_error_json(err, "read_vec3"));
+            Json j = Json::obj();
+            j.set("x", (double)v[0]); j.set("y", (double)v[1]); j.set("z", (double)v[2]);
+            return ok(j);
+        });
+
+    reg("read_mat4", "Read a 4x4 float matrix (row-major).",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")} }, {"pid", "address"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            float v[16];
+            DWORD err = 0;
+            if (!read_mem(pid, addr, v, 64, &err)) return fail_json(win32_error_json(err, "read_mat4"));
+            Json rows = Json::arr();
+            for (int r = 0; r < 4; ++r) {
+                Json row = Json::arr();
+                for (int c = 0; c < 4; ++c) row.push((double)v[r * 4 + c]);
+                rows.push(std::move(row));
+            }
+            Json j = Json::obj();
+            j.set("matrix", std::move(rows));
+            return ok(j);
+        });
+
+    reg("read_cstr", "Read a null-terminated string.",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")},
+                  {"max", prop("integer", "default 256")} }, {"pid", "address"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            size_t n = a.has("max") ? (size_t)parse_u64(a.at("max")) : 256;
+            if (n > 65536) n = 65536;
+            std::vector<char> buf(n, 0);
+            DWORD err = 0;
+            if (!read_mem(pid, addr, buf.data(), n, &err))
+                return fail_json(win32_error_json(err, "read_cstr"));
+            Json j = Json::obj();
+            j.set("string", std::string(buf.data()));
+            return ok(j);
+        });
+
+    reg("read_struct", "Declarative struct read: pass fields [{name, offset, type}] and get values "
+                       "in one call. Optionally resolve a pointer chain first (module+offsets).",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")},
+                  {"module", prop("string", "optional: resolve base from module")},
+                  {"offsets", prop("array", "optional pointer chain offsets")},
+                  {"fields", prop("array", "[{name, offset, type}]")} }, {"pid", "fields"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            bool okb = false;
+            uint64_t base = resolve_base(pid, a, okb);
+            if (!okb) return fail("could not resolve base (module/offsets)");
+
+            Json out = Json::obj();
+            out.set("base", u64_hex(base));
+            for (auto& f : a.at("fields").a) {
+                if (!f.has("name") || !f.has("offset")) continue;
+                std::string name = f.at("name").as_s();
+                uint64_t off = parse_u64(f.at("offset"));
+                std::string type = f.has("type") ? f.at("type").as_s() : "i32";
+                put_typed(pid, base + off, type, out, name);
+            }
+            return ok(out);
+        });
+
+    // ---------------------------------------------------------- watch series
+    reg("watch_series", "Return the recorded time series for a watch (differential RE).",
+        schema({ {"id", prop("integer", "")}, {"count", prop("integer", "last N samples")} }, {"id"}),
+        [](const Json& a) {
+            size_t c = a.has("count") ? (size_t)parse_u64(a.at("count")) : 0;
+            return ok(watch_series((int)parse_u64(a.at("id")), c));
+        });
+
+    // ---------------------------------------------------------- snapshots
+    reg("snapshot_take", "Snapshot a memory range for later differential comparison.",
+        schema({ {"pid", prop("integer", "")}, {"address", prop("string", "")},
+                  {"size", prop("integer", "")} }, {"pid", "address", "size"}),
+        [](const Json& a) {
+            uint32_t pid = (uint32_t)parse_u64(a.at("pid"));
+            uint64_t addr = parse_u64(a.at("address"));
+            size_t n = (size_t)parse_u64(a.at("size"));
+            int id = snapshot_take(pid, addr, n);
+            if (id < 0) return fail("snapshot read failed (check address/size)");
+            Json j = Json::obj();
+            j.set("id", (long long)id);
+            j.set("address", u64_hex(addr));
+            j.set("size", (long long)n);
+            return ok(j);
+        });
+
+    reg("snapshot_diff", "Diff a snapshot against current memory: changed ranges with before/after.",
+        schema({ {"id", prop("integer", "")} }, {"id"}),
+        [](const Json& a) { return ok(snapshot_diff((int)parse_u64(a.at("id")))); });
+
+    reg("snapshot_list", "List stored snapshots.", schema(Json::obj()),
+        [](const Json&) { return ok(snapshot_list()); });
+
+    // ---------------------------------------------------------- persistence
+    reg("scan_save", "Persist the current scan session to disk (survives restarts/timeouts).",
+        schema({ {"path", prop("string", "")} }, {"path"}),
+        [](const Json& a) {
+            std::string err;
+            bool okp = scan_save(a.at("path").as_s(), err);
+            if (!okp) return fail(err);
+            Json j = Json::obj();
+            j.set("saved", true);
+            j.set("path", a.at("path").as_s());
+            return ok(j);
+        });
+
+    reg("scan_load", "Restore a previously saved scan session from disk.",
+        schema({ {"path", prop("string", "")} }, {"path"}),
+        [](const Json& a) {
+            std::string err;
+            bool okp = scan_load(a.at("path").as_s(), err);
+            if (!okp) return fail(err);
+            Json j = Json::obj();
+            j.set("loaded", true);
+            j.set("path", a.at("path").as_s());
+            return ok(j);
         });
 }
 

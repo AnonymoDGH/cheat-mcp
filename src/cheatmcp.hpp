@@ -39,23 +39,36 @@ struct ModInfo {
     uint64_t size = 0;
 };
 
+struct ProcCandidate {
+    ProcInfo info;
+    uint64_t working_set = 0;
+};
+
 bool enable_debug_privilege();
+bool current_process_elevated();
 
 std::vector<ProcInfo> list_processes();
 std::vector<ModInfo>  list_modules(uint32_t pid);
-std::vector<ProcInfo> list_threads_owners();                 // (unused helper kept simple)
+std::vector<ProcInfo> list_threads_owners();
 std::vector<std::pair<uint32_t, std::string>> list_threads(uint32_t pid);
 
 std::optional<ModInfo>  find_module(uint32_t pid, const std::string& name);
 std::optional<ProcInfo> find_process(const std::string& name);
+std::vector<ProcCandidate> find_process_candidates(const std::string& name);
 
 HANDLE get_handle(uint32_t pid);
+HANDLE get_handle_err(uint32_t pid, DWORD* err);
 void   drop_handle(uint32_t pid);
 bool   is_process_64(uint32_t pid);
 
+// ============================================================ errors
+std::string win32_error_string(DWORD err);
+std::string win32_hint(DWORD err);
+Json        win32_error_json(DWORD err, const std::string& context);
+
 // ============================================================ memory
-bool read_mem(uint32_t pid, uint64_t addr, void* buf, size_t n);
-bool write_mem(uint32_t pid, uint64_t addr, const void* buf, size_t n);
+bool read_mem(uint32_t pid, uint64_t addr, void* buf, size_t n, DWORD* err = nullptr);
+bool write_mem(uint32_t pid, uint64_t addr, const void* buf, size_t n, DWORD* err = nullptr);
 uint64_t alloc_mem(uint32_t pid, size_t n, uint32_t protect);
 bool free_mem(uint32_t pid, uint64_t addr);
 bool protect_mem(uint32_t pid, uint64_t addr, size_t n, uint32_t newprot, uint32_t* oldprot = nullptr);
@@ -84,14 +97,24 @@ size_t scan_first(uint32_t pid, ScanType type, const std::string& value, bool wr
 size_t scan_aob(uint32_t pid, const std::string& pattern, bool writable_only, size_t max_hits);
 size_t scan_refine(uint32_t pid, const std::string& mode, const std::string& value);
 Json   scan_results(size_t offset, size_t limit, uint32_t pid, const std::string& type_name);
+Json   hits_json(uint32_t pid, size_t offset, size_t limit);
 Json   pointer_scan(uint32_t pid, uint64_t target, size_t max_offset, size_t max_results);
 void   scan_reset();
+
+// exact-value scan over (optionally writable) memory, returns addresses
+std::vector<uint64_t> scan_exact_value(uint32_t pid, uint64_t value, int width,
+                                       bool writable_only, bool aligned, size_t max_hits);
+
+// persistence between calls
+bool scan_save(const std::string& path, std::string& err);
+bool scan_load(const std::string& path, std::string& err);
 
 // ============================================================ injection
 struct InjectResult {
     bool ok = false;
     uint64_t value = 0;
     std::string error;
+    DWORD win32_error = 0;
 };
 
 InjectResult inject_dll(uint32_t pid, const std::string& dll, const std::string& method);
@@ -121,7 +144,13 @@ Json freeze_list();
 
 Json watch_add(uint32_t pid, uint64_t addr, size_t width, const std::string& type);
 Json watch_poll(int id);
+Json watch_series(int id, size_t count);
 Json watch_remove(int id);
+
+// memory snapshots + differential diff
+int  snapshot_take(uint32_t pid, uint64_t addr, size_t size);
+Json snapshot_diff(int id);
+Json snapshot_list();
 
 Json iat_hook(uint32_t pid, const std::string& module, const std::string& import,
               const std::vector<uint8_t>& stub);
@@ -129,6 +158,17 @@ Json speedhack(uint32_t pid, double scale, const std::string& which);
 
 void runtime_start();
 void runtime_stop();
+
+// ============================================================ elevation / agent
+bool elevate_agent(std::string& err);
+bool agent_connected();
+bool agent_alive();
+Json agent_call(const std::string& tool, const Json& args);
+void agent_shutdown();
+void run_agent_loop(const std::string& pipe_name);
+bool elevated_route_enabled();
+void set_elevated_route(bool v);
+Json elevated_status();
 
 // ============================================================ tool registry / mcp
 struct ToolResult {

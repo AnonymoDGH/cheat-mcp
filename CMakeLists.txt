@@ -19,6 +19,7 @@ target_link_libraries(cheatmcp PRIVATE
   ws2_32
   advapi32
   user32
+  shell32
   ntdll
 )
 

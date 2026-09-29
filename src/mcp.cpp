@@ -19,6 +19,16 @@ void Registry::add(const std::string& name, const std::string& desc, Json sch, T
     tools_[name] = std::move(t);
 }
 
+// Tools that must never be forwarded to the elevated agent.
+static bool is_routable(const std::string& name) {
+    static const char* blocked[] = {
+        "elevate", "run_elevated", "elevated_status", "elevated_route",
+        "agent_shutdown", "system_info", "convert",
+    };
+    for (auto* b : blocked) if (name == b) return false;
+    return true;
+}
+
 ToolResult Registry::call(const std::string& name, const Json& args) const {
     auto it = tools_.find(name);
     if (it == tools_.end()) {
@@ -30,6 +40,17 @@ ToolResult Registry::call(const std::string& name, const Json& args) const {
         r.text = j.dump();
         return r;
     }
+
+    // Transparent routing to the elevated agent when enabled.
+    if (elevated_route_enabled() && agent_connected() && is_routable(name)) {
+        Json resp = agent_call(name, args);
+        ToolResult tr;
+        tr.is_error = resp.has("is_error") ? resp.at("is_error").as_b() : true;
+        tr.text = resp.has("text") ? resp.at("text").as_s() : resp.dump();
+        tr.structured = resp.has("structured") ? resp.at("structured") : resp;
+        return tr;
+    }
+
     try {
         return it->second.fn(args);
     } catch (const std::exception& e) {

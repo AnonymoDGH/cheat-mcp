@@ -12,7 +12,7 @@
 namespace cmcp {
 
 // -----------------------------------------------------------------------------
-// helpers
+// string helpers
 // -----------------------------------------------------------------------------
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
@@ -52,7 +52,7 @@ std::vector<uint8_t> parse_hex(const std::string& s) {
         if (c >= '0' && c <= '9') v = c - '0';
         else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
         else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
-        else continue; // skip spaces, commas, 0x, etc.
+        else continue;
         if (hi < 0) hi = v;
         else { out.push_back((uint8_t)((hi << 4) | v)); hi = -1; }
     }
@@ -72,7 +72,63 @@ std::string to_hex(const uint8_t* p, size_t n) {
 }
 
 // -----------------------------------------------------------------------------
-// privileges
+// win32 error reporting
+// -----------------------------------------------------------------------------
+std::string win32_error_string(DWORD err) {
+    LPSTR buf = nullptr;
+    DWORD n = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&buf, 0, nullptr);
+    std::string s;
+    if (n && buf) {
+        s.assign(buf, n);
+        while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
+        LocalFree(buf);
+    } else {
+        s = "unknown error";
+    }
+    return s;
+}
+
+std::string win32_hint(DWORD err) {
+    switch (err) {
+        case ERROR_ACCESS_DENIED:
+            return "ACCESS_DENIED (target protected, PPL, UIPI, or not elevated) — try elevate()";
+        case ERROR_INVALID_PARAMETER:
+            return "INVALID_PARAMETER (bad address/size/protection)";
+        case ERROR_INVALID_HANDLE:
+            return "INVALID_HANDLE (process handle closed or never opened)";
+        case ERROR_PARTIAL_COPY:
+            return "PARTIAL_COPY (part of the range is unmapped/unreadable — read page-aligned or smaller)";
+        case ERROR_NOACCESS:
+            return "NOACCESS (page not readable; check memory_regions)";
+        case ERROR_FILE_NOT_FOUND:
+            return "FILE_NOT_FOUND (process/module/path not found)";
+        case ERROR_ELEVATION_REQUIRED:
+            return "ELEVATION_REQUIRED (operation needs admin — call elevate())";
+        case ERROR_NOT_ALL_ASSIGNED:
+            return "NOT_ALL_ASSIGNED (privilege could not be enabled; token not elevated)";
+        case ERROR_ALREADY_EXISTS:
+            return "ALREADY_EXISTS";
+        case ERROR_NOT_FOUND:
+            return "NOT_FOUND";
+        default:
+            return "";
+    }
+}
+
+Json win32_error_json(DWORD err, const std::string& context) {
+    Json j = Json::obj();
+    j.set("context", context);
+    j.set("win32_error", (long long)err);
+    j.set("win32_message", win32_error_string(err));
+    std::string h = win32_hint(err);
+    if (!h.empty()) j.set("hint", h);
+    return j;
+}
+
+// -----------------------------------------------------------------------------
+// privileges / elevation
 // -----------------------------------------------------------------------------
 bool enable_debug_privilege() {
     HANDLE tok = nullptr;
@@ -90,6 +146,18 @@ bool enable_debug_privilege() {
     return ok && err == ERROR_SUCCESS;
 }
 
+bool current_process_elevated() {
+    BOOL admin = FALSE;
+    PSID grp = nullptr;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &grp)) {
+        CheckTokenMembership(nullptr, grp, &admin);
+        FreeSid(grp);
+    }
+    return admin != FALSE;
+}
+
 // -----------------------------------------------------------------------------
 // process enumeration
 // -----------------------------------------------------------------------------
@@ -100,7 +168,6 @@ std::vector<ProcInfo> list_processes() {
 
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    // Process PPID field exists in PROCESSENTRY32 (th32ParentProcessID)
     if (Process32FirstW(snap, &pe)) {
         do {
             ProcInfo pi;
@@ -148,14 +215,35 @@ std::vector<std::pair<uint32_t, std::string>> list_threads(uint32_t pid) {
 
 std::optional<ProcInfo> find_process(const std::string& name) {
     std::string want = lower(name);
-    for (auto& p : list_processes()) {
-        if (lower(p.name) == want) return p;
-    }
-    // substring fallback
-    for (auto& p : list_processes()) {
-        if (lower(p.name).find(want) != std::string::npos) return p;
-    }
+    for (auto& p : list_processes()) if (lower(p.name) == want) return p;
+    for (auto& p : list_processes()) if (lower(p.name).find(want) != std::string::npos) return p;
     return std::nullopt;
+}
+
+static uint64_t working_set_of(uint32_t pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    uint64_t ws = 0;
+    if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) ws = pmc.WorkingSetSize;
+    CloseHandle(h);
+    return ws;
+}
+
+std::vector<ProcCandidate> find_process_candidates(const std::string& name) {
+    std::string want = lower(basename(name));
+    std::vector<ProcCandidate> exact, partial;
+    for (auto& p : list_processes()) {
+        std::string n = lower(p.name);
+        if (n == want) exact.push_back({ p, working_set_of(p.pid) });
+        else if (n.find(want) != std::string::npos) partial.push_back({ p, working_set_of(p.pid) });
+    }
+    auto& use = exact.empty() ? partial : exact;
+    std::sort(use.begin(), use.end(),
+              [](const ProcCandidate& a, const ProcCandidate& b) {
+                  return a.working_set > b.working_set;
+              });
+    return use;
 }
 
 // -----------------------------------------------------------------------------
@@ -164,18 +252,27 @@ std::optional<ProcInfo> find_process(const std::string& name) {
 static std::mutex g_handle_mtx;
 static std::map<uint32_t, HANDLE> g_handles;
 
-HANDLE get_handle(uint32_t pid) {
+HANDLE get_handle_err(uint32_t pid, DWORD* err) {
     std::lock_guard<std::mutex> lk(g_handle_mtx);
     auto it = g_handles.find(pid);
-    if (it != g_handles.end()) return it->second;
+    if (it != g_handles.end()) { if (err) *err = 0; return it->second; }
 
     HANDLE h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!h) h = OpenProcess(
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-        PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME,
-        FALSE, pid);
+    DWORD e1 = GetLastError();
+    if (!h) {
+        h = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+            PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME,
+            FALSE, pid);
+        e1 = GetLastError();
+    }
     if (h) g_handles[pid] = h;
+    if (err) *err = h ? 0 : e1;
     return h;
+}
+
+HANDLE get_handle(uint32_t pid) {
+    return get_handle_err(pid, nullptr);
 }
 
 void drop_handle(uint32_t pid) {
@@ -207,7 +304,6 @@ std::vector<ModInfo> list_modules(uint32_t pid) {
     HMODULE mods[1024];
     DWORD needed = 0;
     if (!EnumProcessModulesEx(h, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
-        // fall back to 32-bit listing
         if (!EnumProcessModules(h, mods, sizeof(mods), &needed)) return out;
     }
     DWORD count = needed / sizeof(HMODULE);
@@ -243,27 +339,39 @@ std::optional<ModInfo> find_module(uint32_t pid, const std::string& name) {
 // -----------------------------------------------------------------------------
 // memory primitives
 // -----------------------------------------------------------------------------
-bool read_mem(uint32_t pid, uint64_t addr, void* buf, size_t n) {
-    HANDLE h = get_handle(pid);
-    if (!h) return false;
+bool read_mem(uint32_t pid, uint64_t addr, void* buf, size_t n, DWORD* err) {
+    DWORD e = 0;
+    HANDLE h = get_handle_err(pid, &e);
+    if (!h) { if (err) *err = e; return false; }
     SIZE_T got = 0;
-    return ReadProcessMemory(h, (LPCVOID)(uintptr_t)addr, buf, n, &got) && got == n;
+    BOOL ok = ReadProcessMemory(h, (LPCVOID)(uintptr_t)addr, buf, n, &got);
+    if (!ok) { if (err) *err = GetLastError(); return false; }
+    if (got != n) { if (err) *err = ERROR_PARTIAL_COPY; return false; }
+    if (err) *err = 0;
+    return true;
 }
 
-bool write_mem(uint32_t pid, uint64_t addr, const void* buf, size_t n) {
-    HANDLE h = get_handle(pid);
-    if (!h) return false;
+bool write_mem(uint32_t pid, uint64_t addr, const void* buf, size_t n, DWORD* err) {
+    DWORD e = 0;
+    HANDLE h = get_handle_err(pid, &e);
+    if (!h) { if (err) *err = e; return false; }
 
     SIZE_T done = 0;
-    if (WriteProcessMemory(h, (LPVOID)(uintptr_t)addr, buf, n, &done) && done == n) return true;
+    if (WriteProcessMemory(h, (LPVOID)(uintptr_t)addr, buf, n, &done) && done == n) {
+        if (err) *err = 0;
+        return true;
+    }
+    DWORD werr = GetLastError();
 
-    // retry after lifting page protection
     DWORD oldp = 0;
     if (VirtualProtectEx(h, (LPVOID)(uintptr_t)addr, n, PAGE_EXECUTE_READWRITE, &oldp)) {
         bool ok = WriteProcessMemory(h, (LPVOID)(uintptr_t)addr, buf, n, &done) && done == n;
+        DWORD werr2 = ok ? 0 : GetLastError();
         VirtualProtectEx(h, (LPVOID)(uintptr_t)addr, n, oldp, &oldp);
+        if (err) *err = werr2;
         return ok;
     }
+    if (err) *err = werr;
     return false;
 }
 
